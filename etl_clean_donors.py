@@ -15,7 +15,7 @@ from rapidfuzz import fuzz, process  # fuzzy matching
 # ----------------------------
 DB_HOST = 'localhost'
 DB_PORT = '5432'
-DB_NAME = 'track_donor_v4'
+DB_NAME = 'track_donor'
 DB_USER = 'postgres'
 DB_PASSWORD = 'root'
 
@@ -313,7 +313,7 @@ def employer_to_canon(emp_clean: str) -> Optional[str]:
     return None
 
 # ----------------------------
-# SQL templates (متوافقة مع DDL)
+# SQL 
 # ----------------------------
 MASTER_MIN_SQL = text("""
 INSERT INTO public.donors_master (
@@ -426,7 +426,7 @@ def main():
           contributor_city, contributor_state, contributor_zip,
           contributor_employer, contributor_occupation,
           is_individual,
-          committee_id, committee_name,
+          committee_id,
           contribution_receipt_date, contribution_receipt_amount,
           two_year_transaction_period, lat, lng
         FROM public.contributions
