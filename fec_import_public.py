@@ -1,7 +1,7 @@
-# fec_import_public.py (lean: no DDL, no addr_fp/payload)
+# fec_import_public.py
 import os, sys, argparse, datetime as dt
 from time import monotonic, sleep
-from typing import Dict, Any, Tuple, Optional, List
+from typing import Dict, Any, Tuple, Optional
 import random
 
 import requests
@@ -51,7 +51,7 @@ def parse_retry_after(resp):
     except Exception:
         return None
 
-def maybe_pace_by_headers(resp, debug=False, limiter: RateLimiter | None = None):
+def maybe_pace_by_headers(resp, debug=False, limiter: "RateLimiter | None" = None):
     if not limiter:
         return
     remaining = resp.headers.get("X-RateLimit-Remaining")
@@ -62,6 +62,7 @@ def maybe_pace_by_headers(resp, debug=False, limiter: RateLimiter | None = None)
     except Exception:
         remaining_val = None
         reset_val = None
+
     if remaining_val is not None and remaining_val <= 0 and reset_val is not None:
         if debug:
             print(f"[RATE] Remaining=0; backing off for reset {reset_val}s")
@@ -76,40 +77,255 @@ def env_or_die(name: str) -> str:
         sys.exit(2)
     return v
 
-# اختياري: فحص الأعمدة فقط (بدون تعديل)
-REQUIRED_COLUMNS = {
-    "public.contributions": [
-        "contrib_row_id",
-        "sub_id", "transaction_id", "two_year_transaction_period", "committee_id",
-        "contributor_name", "contributor_first_name", "contributor_last_name",
-        "contributor_street_1", "contributor_street_2", "contributor_city",
-        "contributor_state", "contributor_zip", "contributor_employer",
-        "contributor_occupation", "is_individual",
-        "contribution_receipt_date", "contributor_year",
-        "contribution_receipt_amount", "contribution_aggregate_ytd",
-        "is_refunded_or_reattributed", "contribution_refunded_amount",
-        "line_number", "line_number_label",
-        "lat", "lng", "geocode_provider", "geocode_checked_at"
-    ],
-    "public.sync_cursor": [
-        "committee_id", "period", "watermark_date", "last_page_date", "last_index",
-        "cursor_updated_at", "last_run_at"
-    ]
-}
-
-def check_schema(conn, debug=False):
+# نتأكد من وجود الفهارس الداعمة للـ upsert (بدون تغيير الأعمدة)
+def ensure_constraints(conn):
     with conn.cursor() as cur:
-        for table, cols in REQUIRED_COLUMNS.items():
-            cur.execute("""
-                SELECT column_name FROM information_schema.columns
-                WHERE table_schema = %s AND table_name = %s
-            """, (table.split('.')[0], table.split('.')[1]))
-            got = {r["column_name"] for r in cur.fetchall()}
-            miss = [c for c in cols if c not in got]
-            if miss:
-                print(f"[WARN] Missing columns in {table}: {', '.join(miss)}", file=sys.stderr)
-            elif debug:
-                print(f"[OK] {table} schema looks good")
+        # فهرس فريد على sub_id (لو عندك بالفعل قيد UNIQUE(sub_id) فهالإنشاء سيتخطّاه)
+        cur.execute("""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_indexes
+                WHERE schemaname='public' AND indexname='ux_contributions_sub_id'
+            ) THEN
+                EXECUTE 'CREATE UNIQUE INDEX ux_contributions_sub_id ON public.contributions (sub_id)';
+            END IF;
+        END$$;
+        """)
+        # فهرس فريد على (transaction_id, contribution_receipt_date, contribution_receipt_amount)
+        cur.execute("""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_indexes
+                WHERE schemaname='public' AND indexname='ux_contributions_txn_date_amount'
+            ) THEN
+                EXECUTE 'CREATE UNIQUE INDEX ux_contributions_txn_date_amount
+                         ON public.contributions (transaction_id, contribution_receipt_date, contribution_receipt_amount)';
+            END IF;
+        END$$;
+        """)
+    conn.commit()
+
+# --------------------------- HTTP session & fetch ---------------------------
+
+def build_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=5, connect=3, read=3, backoff_factor=1.0,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    s.headers["User-Agent"] = "fec-import/1.0"
+    return s
+
+def fetch_schedule_a(session: requests.Session, params: Dict[str, Any], limiter: RateLimiter, debug=False) -> Dict[str, Any]:
+    retries = 0
+    while True:
+        limiter.before_request()
+        if debug:
+            print(f"[HTTP] GET {BASE_URL} params={params}")
+        try:
+            resp = session.get(BASE_URL, params=params, timeout=(10, 180))
+        except (ReadTimeout, ConnectTimeout, ConnectionError) as e:
+            wait = min(60.0, (2 ** retries)) + random.uniform(0, 0.5)
+            if debug:
+                print(f"[HTTP] timeout/conn error: {type(e).__name__}. sleeping {wait:.1f}s, retry={retries}")
+            sleep(wait); retries += 1
+            limiter.after_rate_limit(wait)
+            continue
+
+        status = resp.status_code
+
+        if status == 429 or "OVER_RATE_LIMIT" in resp.text:
+            ra = parse_retry_after(resp)
+            if debug:
+                print(f"[RATE] 429/OVER_RATE_LIMIT. Retry-After={ra}. Backoff={limiter.backoff}")
+            limiter.after_rate_limit(ra)
+            continue
+
+        if status in (500, 502, 503, 504):
+            wait = min(60.0, 2.0 * (2 ** retries))
+            if debug:
+                print(f"[HTTP] {status} server error. Sleeping {wait:.1f}s, retry={retries}")
+            sleep(wait); retries += 1
+            continue
+
+        resp.raise_for_status()
+        maybe_pace_by_headers(resp, debug=debug, limiter=limiter)
+        limiter.after_success()
+        return resp.json()
+
+# --------------------------- Row builders & DB ops ---------------------------
+
+# جدولك حسب الاستعلام:
+# contrib_row_id, sub_id, transaction_id, two_year_transaction_period, committee_id,
+# contributor_name, contributor_first_name, contributor_last_name, contributor_street_1, contributor_street_2,
+# contributor_city, contributor_state, contributor_zip, contributor_employer, contributor_occupation,
+# is_individual, contribution_receipt_date, contributor_year, contribution_receipt_amount,
+# contribution_aggregate_ytd, is_refunded_or_reattributed, contribution_refunded_amount,
+# line_number, line_number_label, lat, lng, geocode_provider, geocode_checked_at
+
+def build_row(r: Dict[str, Any]) -> Dict[str, Any]:
+    dstr = r.get("contribution_receipt_date")
+    contributor_year = None
+    if dstr:
+        try:
+            contributor_year = dt.date.fromisoformat(dstr).year
+        except Exception:
+            contributor_year = None
+
+    return {
+        "sub_id": r.get("sub_id"),
+        "transaction_id": r.get("transaction_id"),
+        "two_year_transaction_period": r.get("two_year_transaction_period"),
+        "committee_id": r.get("committee_id"),
+        "contributor_name": r.get("contributor_name"),
+        "contributor_first_name": r.get("contributor_first_name"),
+        "contributor_last_name": r.get("contributor_last_name"),
+        "contributor_street_1": r.get("contributor_street_1"),
+        "contributor_street_2": r.get("contributor_street_2"),
+        "contributor_city": r.get("contributor_city"),
+        "contributor_state": r.get("contributor_state"),
+        "contributor_zip": r.get("contributor_zip"),
+        "contributor_employer": r.get("contributor_employer"),
+        "contributor_occupation": r.get("contributor_occupation"),
+        "is_individual": r.get("is_individual"),
+        "contribution_receipt_date": dstr,
+        "contributor_year": contributor_year,
+        "contribution_receipt_amount": r.get("contribution_receipt_amount") or 0,
+        "contribution_aggregate_ytd": r.get("contribution_aggregate_ytd"),
+        "is_refunded_or_reattributed": r.get("is_refunded_or_reattributed"),
+        "contribution_refunded_amount": r.get("contribution_refunded_amount"),
+        "line_number": r.get("line_number"),
+        "line_number_label": r.get("line_number_label"),
+        "lat": None,
+        "lng": None,
+        "geocode_provider": None,
+        "geocode_checked_at": None,
+    }
+
+def upsert_by_sub(cur, row: Dict[str, Any]) -> Tuple[int, int]:
+    sql = (
+        "INSERT INTO public.contributions ("
+        "  sub_id, transaction_id, two_year_transaction_period, committee_id,"
+        "  contributor_name, contributor_first_name, contributor_last_name,"
+        "  contributor_street_1, contributor_street_2, contributor_city, contributor_state, contributor_zip,"
+        "  contributor_employer, contributor_occupation,"
+        "  is_individual, contribution_receipt_date, contributor_year, contribution_receipt_amount, contribution_aggregate_ytd,"
+        "  is_refunded_or_reattributed, contribution_refunded_amount,"
+        "  line_number, line_number_label, lat, lng, geocode_provider, geocode_checked_at"
+        ") VALUES ("
+        "  %(sub_id)s, %(transaction_id)s, %(two_year_transaction_period)s, %(committee_id)s,"
+        "  %(contributor_name)s, %(contributor_first_name)s, %(contributor_last_name)s,"
+        "  %(contributor_street_1)s, %(contributor_street_2)s, %(contributor_city)s, %(contributor_state)s, %(contributor_zip)s,"
+        "  %(contributor_employer)s, %(contributor_occupation)s,"
+        "  %(is_individual)s, %(contribution_receipt_date)s, %(contributor_year)s, %(contribution_receipt_amount)s, %(contribution_aggregate_ytd)s,"
+        "  %(is_refunded_or_reattributed)s, %(contribution_refunded_amount)s,"
+        "  %(line_number)s, %(line_number_label)s, %(lat)s, %(lng)s, %(geocode_provider)s, %(geocode_checked_at)s"
+        ") ON CONFLICT (sub_id) DO UPDATE SET "
+        "  transaction_id = EXCLUDED.transaction_id,"
+        "  two_year_transaction_period = EXCLUDED.two_year_transaction_period,"
+        "  committee_id = EXCLUDED.committee_id,"
+        "  contributor_name = EXCLUDED.contributor_name,"
+        "  contributor_first_name = EXCLUDED.contributor_first_name,"
+        "  contributor_last_name = EXCLUDED.contributor_last_name,"
+        "  contributor_street_1 = EXCLUDED.contributor_street_1,"
+        "  contributor_street_2 = EXCLUDED.contributor_street_2,"
+        "  contributor_city = EXCLUDED.contributor_city,"
+        "  contributor_state = EXCLUDED.contributor_state,"
+        "  contributor_zip = EXCLUDED.contributor_zip,"
+        "  contributor_employer = EXCLUDED.contributor_employer,"
+        "  contributor_occupation = EXCLUDED.contributor_occupation,"
+        "  is_individual = EXCLUDED.is_individual,"
+        "  contribution_receipt_date = EXCLUDED.contribution_receipt_date,"
+        "  contributor_year = EXCLUDED.contributor_year,"
+        "  contribution_receipt_amount = EXCLUDED.contribution_receipt_amount,"
+        "  contribution_aggregate_ytd = EXCLUDED.contribution_aggregate_ytd,"
+        "  is_refunded_or_reattributed = EXCLUDED.is_refunded_or_reattributed,"
+        "  contribution_refunded_amount = EXCLUDED.contribution_refunded_amount,"
+        "  line_number = EXCLUDED.line_number,"
+        "  line_number_label = EXCLUDED.line_number_label,"
+        "  lat = COALESCE(EXCLUDED.lat, public.contributions.lat),"
+        "  lng = COALESCE(EXCLUDED.lng, public.contributions.lng),"
+        "  geocode_provider = COALESCE(EXCLUDED.geocode_provider, public.contributions.geocode_provider),"
+        "  geocode_checked_at = COALESCE(EXCLUDED.geocode_checked_at, public.contributions.geocode_checked_at) "
+        "RETURNING (xmax = 0) AS inserted;"
+    )
+    cur.execute(sql, row)
+    ret = cur.fetchone()
+    inserted = bool(ret and (ret.get('inserted') if isinstance(ret, dict) else ret[0]))
+    return (1, 0) if inserted else (0, 1)
+
+def insert_by_txn_or_ignore(cur, row: Dict[str, Any]) -> Tuple[int, int]:
+    # fallback إذا ما فيه sub_id: منع التكرار على (transaction_id, date, amount)
+    sql = (
+        "INSERT INTO public.contributions ("
+        "  sub_id, transaction_id, two_year_transaction_period, committee_id,"
+        "  contributor_name, contributor_first_name, contributor_last_name,"
+        "  contributor_street_1, contributor_street_2, contributor_city, contributor_state, contributor_zip,"
+        "  contributor_employer, contributor_occupation,"
+        "  is_individual, contribution_receipt_date, contributor_year, contribution_receipt_amount, contribution_aggregate_ytd,"
+        "  is_refunded_or_reattributed, contribution_refunded_amount,"
+        "  line_number, line_number_label, lat, lng, geocode_provider, geocode_checked_at"
+        ") VALUES ("
+        "  %(sub_id)s, %(transaction_id)s, %(two_year_transaction_period)s, %(committee_id)s,"
+        "  %(contributor_name)s, %(contributor_first_name)s, %(contributor_last_name)s,"
+        "  %(contributor_street_1)s, %(contributor_street_2)s, %(contributor_city)s, %(contributor_state)s, %(contributor_zip)s,"
+        "  %(contributor_employer)s, %(contributor_occupation)s,"
+        "  %(is_individual)s, %(contribution_receipt_date)s, %(contributor_year)s, %(contribution_receipt_amount)s, %(contribution_aggregate_ytd)s,"
+        "  %(is_refunded_or_reattributed)s, %(contribution_refunded_amount)s,"
+        "  %(line_number)s, %(line_number_label)s, %(lat)s, %(lng)s, %(geocode_provider)s, %(geocode_checked_at)s"
+        ") ON CONFLICT (transaction_id, contribution_receipt_date, contribution_receipt_amount) DO NOTHING "
+        "RETURNING 1;"
+    )
+    cur.execute(sql, row)
+    return (1, 0) if cur.fetchone() else (0, 1)
+
+def flush_batch(conn, batch, debug, counters):
+    if not batch:
+        return
+    inserted = updated = ignored = 0
+    with conn.cursor() as cur:
+        for b in batch:
+            if b["sub_id"] is not None:
+                ins, upd = upsert_by_sub(cur, b)
+                inserted += ins; updated += upd
+            elif b["transaction_id"] and b["contribution_receipt_date"] and b["contribution_receipt_amount"] is not None:
+                ins, ign = insert_by_txn_or_ignore(cur, b)
+                inserted += ins; ignored += ign
+            else:
+                # إدخال عادي لو ما توفر أي مفتاح
+                cur.execute(
+                    "INSERT INTO public.contributions ("
+                    "  sub_id, transaction_id, two_year_transaction_period, committee_id,"
+                    "  contributor_name, contributor_first_name, contributor_last_name,"
+                    "  contributor_street_1, contributor_street_2, contributor_city, contributor_state, contributor_zip,"
+                    "  contributor_employer, contributor_occupation,"
+                    "  is_individual, contribution_receipt_date, contributor_year, contribution_receipt_amount, contribution_aggregate_ytd,"
+                    "  is_refunded_or_reattributed, contribution_refunded_amount,"
+                    "  line_number, line_number_label, lat, lng, geocode_provider, geocode_checked_at"
+                    ") VALUES ("
+                    "  %(sub_id)s, %(transaction_id)s, %(two_year_transaction_period)s, %(committee_id)s,"
+                    "  %(contributor_name)s, %(contributor_first_name)s, %(contributor_last_name)s,"
+                    "  %(contributor_street_1)s, %(contributor_street_2)s, %(contributor_city)s, %(contributor_state)s, %(contributor_zip)s,"
+                    "  %(contributor_employer)s, %(contributor_occupation)s,"
+                    "  %(is_individual)s, %(contribution_receipt_date)s, %(contributor_year)s, %(contribution_receipt_amount)s, %(contribution_aggregate_ytd)s,"
+                    "  %(is_refunded_or_reattributed)s, %(contribution_refunded_amount)s,"
+                    "  %(line_number)s, %(line_number_label)s, %(lat)s, %(lng)s, %(geocode_provider)s, %(geocode_checked_at)s"
+                    ");",
+                    b
+                )
+                inserted += 1
+        conn.commit()
+    counters["inserted"] += inserted
+    counters["updated"]  += updated
+    counters["ignored"]  += ignored
+    if debug:
+        print(f"[COMMIT] +{len(batch)} rows => inserted={counters['inserted']}, updated={counters['updated']}, ignored={counters['ignored']}")
+
+# --------------------------- Cursor state ---------------------------
 
 def read_cursor(conn, committee_id: str, period: int):
     with conn.cursor() as cur:
@@ -151,175 +367,9 @@ def set_watermark(conn, committee_id: str, period: int, new_date: dt.date):
         """, (committee_id, period, new_date))
     conn.commit()
 
-# --------------------------- HTTP session & fetch ---------------------------
-
-def build_session() -> requests.Session:
-    s = requests.Session()
-    retry = Retry(
-        total=5, connect=3, read=3, backoff_factor=1.0,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"]
-    )
-    s.mount("https://", HTTPAdapter(max_retries=retry))
-    s.headers["User-Agent"] = "fec-import/1.2"
-    return s
-
-def fetch_schedule_a(session: requests.Session, params: Dict[str, Any], limiter: RateLimiter, debug=False) -> Dict[str, Any]:
-    retries = 0
-    while True:
-        limiter.before_request()
-        if debug:
-            print(f"[HTTP] GET {BASE_URL} params={params}")
-        try:
-            resp = session.get(BASE_URL, params=params, timeout=(10, 180))
-        except (ReadTimeout, ConnectTimeout, ConnectionError) as e:
-            wait = min(60.0, (2 ** retries)) + random.uniform(0, 0.5)
-            if debug:
-                print(f"[HTTP] timeout/conn error: {type(e).__name__}. sleeping {wait:.1f}s, retry={retries}")
-            sleep(wait); retries += 1
-            continue
-
-        status = resp.status_code
-
-        if status == 429 or "OVER_RATE_LIMIT" in resp.text:
-            ra = parse_retry_after(resp)
-            if debug:
-                print(f"[RATE] 429/OVER_RATE_LIMIT. Retry-After={ra}. Backoff={limiter.backoff}")
-            limiter.after_rate_limit(ra)
-            continue
-
-        if status in (500, 502, 503, 504):
-            wait = min(60.0, 2.0 * (2 ** retries))
-            if debug:
-                print(f"[HTTP] {status} server error. Sleeping {wait:.1f}s, retry={retries}")
-            sleep(wait); retries += 1
-            continue
-
-        resp.raise_for_status()
-        maybe_pace_by_headers(resp, debug=debug, limiter=limiter)
-        limiter.after_success()
-        return resp.json()
-
-# --------------------------- Row builders & DB ops ---------------------------
-
-_COLUMNS: List[str] = [
-    "contributor_name", "contributor_first_name", "contributor_last_name",
-    "contributor_street_1", "contributor_street_2", "contributor_city", "contributor_state", "contributor_zip",
-    "contributor_employer", "contributor_occupation", "is_individual",
-    "committee_id",
-    "contribution_receipt_date", "contributor_year", "contribution_receipt_amount", "contribution_aggregate_ytd",
-    "is_refunded_or_reattributed", "contribution_refunded_amount",
-    "sub_id", "transaction_id", "two_year_transaction_period",
-    "line_number", "line_number_label",
-    "lat", "lng", "geocode_provider", "geocode_checked_at"
-]
-
-INSERT_SQL_SUB = (
-    "INSERT INTO public.contributions ("
-    + ", ".join(_COLUMNS) +
-    ") VALUES ("
-    + ", ".join([f"%({c})s" for c in _COLUMNS]) +
-    ") ON CONFLICT (sub_id) WHERE sub_id IS NOT NULL DO UPDATE SET "
-    + ", ".join([f"{c} = EXCLUDED.{c}" for c in _COLUMNS if c not in ("sub_id",)])
-    + " RETURNING (xmax = 0) AS inserted;"
-)
-
-INSERT_SQL_TXN = (
-    "INSERT INTO public.contributions ("
-    + ", ".join(_COLUMNS) +
-    ") VALUES ("
-    + ", ".join([f"%({c})s" for c in _COLUMNS]) +
-    ") ON CONFLICT ON CONSTRAINT uq_contrib_txn_fallback DO NOTHING RETURNING 1;"
-)
-
-INSERT_SQL_RAW = (
-    "INSERT INTO public.contributions ("
-    + ", ".join(_COLUMNS) +
-    ") VALUES ("
-    + ", ".join([f"%({c})s" for c in _COLUMNS]) +
-    ");"
-)
-
-def _safe_year(dstr: Optional[str]) -> Optional[int]:
-    if not dstr:
-        return None
-    try:
-        return dt.date.fromisoformat(dstr).year
-    except Exception:
-        return None
-
-def build_row(r: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "contributor_name": r.get("contributor_name"),
-        "contributor_first_name": r.get("contributor_first_name"),
-        "contributor_last_name": r.get("contributor_last_name"),
-        "contributor_street_1": r.get("contributor_street_1"),
-        "contributor_street_2": r.get("contributor_street_2"),
-        "contributor_city": r.get("contributor_city"),
-        "contributor_state": r.get("contributor_state"),
-        "contributor_zip": r.get("contributor_zip"),
-        "contributor_employer": r.get("contributor_employer"),
-        "contributor_occupation": r.get("contributor_occupation"),
-        "is_individual": r.get("is_individual"),
-
-        "committee_id": r.get("committee_id"),
-
-        "contribution_receipt_date": r.get("contribution_receipt_date"),
-        "contributor_year": _safe_year(r.get("contribution_receipt_date")),
-        "contribution_receipt_amount": r.get("contribution_receipt_amount") or 0,
-        "contribution_aggregate_ytd": r.get("contribution_aggregate_ytd"),
-        "is_refunded_or_reattributed": r.get("is_refunded_or_reattributed"),
-        "contribution_refunded_amount": r.get("contribution_refunded_amount"),
-
-        "sub_id": r.get("sub_id"),
-        "transaction_id": r.get("transaction_id"),
-        "two_year_transaction_period": r.get("two_year_transaction_period"),
-
-        "line_number": r.get("line_number"),
-        "line_number_label": r.get("line_number_label"),
-
-        # geo fields left NULL (ready for a later geocoder)
-        "lat": None,
-        "lng": None,
-        "geocode_provider": None,
-        "geocode_checked_at": None,
-    }
-
-def upsert_by_sub(cur, row: Dict[str, Any]) -> Tuple[int,int]:
-    cur.execute(INSERT_SQL_SUB, row)
-    ret = cur.fetchone()
-    inserted = bool(ret and (ret.get('inserted') if isinstance(ret, dict) else ret[0]))
-    return (1,0) if inserted else (0,1)
-
-def insert_by_txn_or_ignore(cur, row: Dict[str, Any]) -> Tuple[int,int]:
-    cur.execute(INSERT_SQL_TXN, row)
-    return (1,0) if cur.fetchone() else (0,1)
-
-def flush_batch(conn, batch, debug, counters):
-    if not batch:
-        return
-    inserted = updated = ignored = 0
-    with conn.cursor() as cur:
-        for b in batch:
-            if b["sub_id"] is not None:
-                ins, upd = upsert_by_sub(cur, b)
-                inserted += ins; updated += upd
-            elif b["transaction_id"] and b["contribution_receipt_date"] and b["contribution_receipt_amount"] is not None:
-                ins, ign = insert_by_txn_or_ignore(cur, b)
-                inserted += ins; ignored += ign
-            else:
-                cur.execute(INSERT_SQL_RAW, b)
-                inserted += 1
-        conn.commit()
-    counters["inserted"] += inserted
-    counters["updated"]  += updated
-    counters["ignored"]  += ignored
-    if debug:
-        print(f"[COMMIT] +{len(batch)} rows => inserted={counters['inserted']}, updated={counters['updated']}, ignored={counters['ignored']}")
-
 # --------------------------- Main runner ---------------------------
 
-def run(committee_id: str, period: int, full: bool, window_days: int, debug: bool, rpm: int, batch_size: int, check_schema_flag: bool):
+def run(committee_id: str, period: int, full: bool, window_days: int, debug: bool, rpm: int):
     dsn = env_or_die("PG_DSN")
     api_key = env_or_die("FEC_API_KEY")
 
@@ -330,8 +380,8 @@ def run(committee_id: str, period: int, full: bool, window_days: int, debug: boo
     total_rows = 0
 
     with connect(dsn, row_factory=dict_row) as conn:
-        if check_schema_flag:
-            check_schema(conn, debug=debug)
+        # نتأكد من الفهارس فقط (لا ننشئ جداول جديدة)
+        ensure_constraints(conn)
 
         wm, resume_date, resume_idx = read_cursor(conn, committee_id, period)
         if full:
@@ -361,7 +411,7 @@ def run(committee_id: str, period: int, full: bool, window_days: int, debug: boo
                 if debug: print(f"[MODE] INCR from {md} (wm={wm}, window={window_days}d)")
 
         max_date_seen = dt.date(1900,1,1)
-        batch: List[Dict[str, Any]] = []
+        batch = []
         page = 0
         total_pages = None
         pbar = None
@@ -396,7 +446,7 @@ def run(committee_id: str, period: int, full: bool, window_days: int, debug: boo
                     except Exception:
                         pass
 
-                if len(batch) >= batch_size:
+                if len(batch) >= 200:
                     flush_batch(conn, batch, debug, counters)
                     batch.clear()
 
@@ -431,17 +481,15 @@ def run(committee_id: str, period: int, full: bool, window_days: int, debug: boo
     print(f"[SUMMARY] processed={total_rows}, inserted={counters['inserted']}, updated={counters['updated']}, ignored={counters['ignored']}")
 
 def main():
-    ap = argparse.ArgumentParser(description="Import FEC Schedule A into public.contributions (no DDL).")
+    ap = argparse.ArgumentParser(description="Import FEC Schedule A into public.contributions (matching your schema) with resume + rate limiting.")
     ap.add_argument("--committee-id", required=True, help="FEC committee ID, e.g., C00797670")
     ap.add_argument("--period", type=int, required=True, help="Two-year transaction period (even year)")
     ap.add_argument("--full", action="store_true", help="Full backfill for the given period")
     ap.add_argument("--window-days", type=int, default=7, help="Incremental safety overlap in days")
-    ap.add_argument("--rpm", type=int, default=int(os.getenv("FEC_RPM", "15")), help="Requests per minute limit")
-    ap.add_argument("--batch-size", type=int, default=int(os.getenv("BATCH_SIZE", "200")), help="DB batch size")
-    ap.add_argument("--check-schema", action="store_true", help="Just verify columns exist; do not modify schema")
+    ap.add_argument("--rpm", type=int, default=int(os.getenv("FEC_RPM", "15")), help="Requests per minute limit (default 15)")
     ap.add_argument("--debug", action="store_true", help="Verbose HTTP/DB logs")
     args = ap.parse_args()
-    run(args.committee_id, args.period, args.full, args.window_days, args.debug, args.rpm, args.batch_size, args.check_schema)
+    run(args.committee_id, args.period, args.full, args.window_days, args.debug, args.rpm)
 
 if __name__ == "__main__":
     main()
