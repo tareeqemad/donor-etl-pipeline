@@ -36,16 +36,8 @@ def insert_from_csv(csv_path: str):
                 cur.execute("SELECT transaction_id FROM contributions")
                 existing_transactions = set(r[0] for r in cur.fetchall())
 
-                successful_inserts = 0
-                failed_inserts = 0
-
                 for idx, row in df.iterrows():
-                    # Use a savepoint for each row so we can rollback individual failures
-                    savepoint_name = f"sp_{idx}"
-
                     try:
-                        cur.execute(f"SAVEPOINT {savepoint_name}")
-
                         # Build full_name
                         full_name = (
                             row.get("contributor_name")
@@ -66,11 +58,9 @@ def insert_from_csv(csv_path: str):
                                 (full_name, "individual"),
                             )
                             contributor_id = cur.fetchone()[0]
-                            existing_contributors[key] = (
-                                contributor_id  # update local cache
-                            )
+                            existing_contributors[key] = contributor_id
 
-                        # 2. Insert into contributor_addresses (remove ON CONFLICT)
+                        # 2. Insert into contributor_addresses
                         cur.execute(
                             """
                             INSERT INTO contributor_addresses
@@ -88,9 +78,8 @@ def insert_from_csv(csv_path: str):
                                 row.get("lng"),
                             ),
                         )
-                        # with .get : Returns None if column missing
 
-                        # 3. Insert into contributor_business (remove ON CONFLICT)
+                        # 3. Insert into contributor_business
                         cur.execute(
                             """
                             INSERT INTO contributor_business
@@ -111,7 +100,6 @@ def insert_from_csv(csv_path: str):
                             logging.info(
                                 f"Skipping already inserted transaction: {transaction_id}"
                             )
-                            cur.execute(f"RELEASE SAVEPOINT {savepoint_name}")
                             continue
 
                         cur.execute(
@@ -134,28 +122,17 @@ def insert_from_csv(csv_path: str):
                         )
                         existing_transactions.add(transaction_id)
 
-                        # Release the savepoint (commit this row)
-                        cur.execute(f"RELEASE SAVEPOINT {savepoint_name}")
-                        successful_inserts += 1
-
                         if (idx + 1) % 1000 == 0:
-                            logging.info(
-                                f"Processed {idx+1}/{len(df)} rows ({successful_inserts} successful, {failed_inserts} failed)"
-                            )
+                            logging.info(f"Processed {idx+1}/{len(df)} rows")
 
                     except Exception as row_err:
                         logging.error(f"Error inserting row {idx+1}: {row_err}")
-                        # Rollback to savepoint (only this row)
-                        cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
-                        cur.execute(f"RELEASE SAVEPOINT {savepoint_name}")
-                        failed_inserts += 1
-                        continue
+                        conn.rollback()
+                        return
 
-                # Commit all successful inserts
+                # Commit all successful inserts at the end
                 conn.commit()
-                logging.info(
-                    f"Processing complete. {successful_inserts} successful inserts, {failed_inserts} failed inserts."
-                )
+                logging.info("All rows committed to database successfully.")
 
     except Exception as e:
         logging.error(f"Database connection or insertion failed: {e}")
